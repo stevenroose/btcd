@@ -202,7 +202,7 @@ type server struct {
 	connManager          *connmgr.ConnManager
 	sigCache             *txscript.SigCache
 	hashCache            *txscript.HashCache
-	rpcServer            *jsonrpcServer
+	rpcServer            *grpcServer
 	syncManager          *netsync.SyncManager
 	chain                *blockchain.BlockChain
 	txMemPool            *mempool.TxPool
@@ -1006,7 +1006,7 @@ func (s *server) AnnounceNewTransactions(txns []*mempool.TxDesc) {
 	// Notify both websocket and getblocktemplate long poll clients of all
 	// newly accepted transactions.
 	if s.rpcServer != nil {
-		s.rpcServer.NotifyNewTransactions(txns)
+		s.rpcServer.HandleNewAcceptedTransactions(txns)
 	}
 }
 
@@ -2101,55 +2101,6 @@ out:
 	s.wg.Done()
 }
 
-// setupRPCListeners returns a slice of listeners that are configured for use
-// with the RPC server depending on the configuration settings for listen
-// addresses and TLS.
-func setupRPCListeners() ([]net.Listener, error) {
-	// Setup TLS if not disabled.
-	listenFunc := net.Listen
-	if !cfg.DisableTLS {
-		// Generate the TLS cert and key file if both don't already
-		// exist.
-		if !fileExists(cfg.RPCKey) && !fileExists(cfg.RPCCert) {
-			err := genCertPair(cfg.RPCCert, cfg.RPCKey)
-			if err != nil {
-				return nil, err
-			}
-		}
-		keypair, err := tls.LoadX509KeyPair(cfg.RPCCert, cfg.RPCKey)
-		if err != nil {
-			return nil, err
-		}
-
-		tlsConfig := tls.Config{
-			Certificates: []tls.Certificate{keypair},
-			MinVersion:   tls.VersionTLS12,
-		}
-
-		// Change the standard net.Listen function to the tls one.
-		listenFunc = func(net string, laddr string) (net.Listener, error) {
-			return tls.Listen(net, laddr, &tlsConfig)
-		}
-	}
-
-	netAddrs, err := parseListeners(cfg.RPCListeners)
-	if err != nil {
-		return nil, err
-	}
-
-	listeners := make([]net.Listener, 0, len(netAddrs))
-	for _, addr := range netAddrs {
-		listener, err := listenFunc(addr.Network(), addr.String())
-		if err != nil {
-			rpcsLog.Warnf("Can't listen on %s: %v", addr, err)
-			continue
-		}
-		listeners = append(listeners, listener)
-	}
-
-	return listeners, nil
-}
-
 // newServer returns a new btcd server configured to listen on addr for the
 // bitcoin network type specified by chainParams.  Use start to begin accepting
 // connections from peers.
@@ -2396,38 +2347,46 @@ func newServer(listenAddrs []string, db database.DB, chainParams *chaincfg.Param
 	if !cfg.DisableRPC {
 		// Setup listeners for the configured RPC listen addresses and
 		// TLS settings.
-		rpcListeners, err := setupRPCListeners()
+		netAddrs, err := parseListeners(cfg.RPCListeners)
 		if err != nil {
 			return nil, err
+		}
+
+		rpcListeners := make([]net.Listener, 0, len(netAddrs))
+		for _, addr := range netAddrs {
+			listener, err := net.Listen(addr.Network(), addr.String())
+			if err != nil {
+				rpcsLog.Warnf("Can't listen on %s: %v", addr, err)
+				continue
+			}
+			rpcListeners = append(rpcListeners, listener)
 		}
 		if len(rpcListeners) == 0 {
 			return nil, errors.New("RPCS: No valid listen address")
 		}
 
-		s.rpcServer, err = newJSONRPCServer(&jsonrpcserverConfig{
-			Listeners:   rpcListeners,
-			StartupTime: s.startupTime,
-			ConnMgr:     &jsonrpcConnManager{&s},
-			SyncMgr:     &jsonrpcSyncMgr{&s, s.syncManager},
-			TimeSource:  s.timeSource,
-			Chain:       s.chain,
-			ChainParams: chainParams,
-			DB:          db,
-			TxMemPool:   s.txMemPool,
-			Generator:   blockTemplateGenerator,
-			CPUMiner:    s.cpuMiner,
-			TxIndex:     s.txIndex,
-			AddrIndex:   s.addrIndex,
-		})
-		if err != nil {
-			return nil, err
+		var tlsConfig tls.Config
+		if !cfg.DisableTLS {
+			// Generate the TLS cert and key file if both don't already
+			// exist.
+			if !fileExists(cfg.RPCKey) && !fileExists(cfg.RPCCert) {
+				err := genCertPair(cfg.RPCCert, cfg.RPCKey)
+				if err != nil {
+					return nil, err
+				}
+			}
+			keypair, err := tls.LoadX509KeyPair(cfg.RPCCert, cfg.RPCKey)
+			if err != nil {
+				return nil, err
+			}
+
+			tlsConfig = tls.Config{
+				Certificates: []tls.Certificate{keypair},
+				MinVersion:   tls.VersionTLS12,
+			}
 		}
 
-		// Signal process shutdown when the RPC server requests it.
-		go func() {
-			<-s.rpcServer.RequestedProcessShutdown()
-			shutdownRequestChannel <- struct{}{}
-		}()
+		s.rpcServer = newGRPCServer(&s, rpcListeners, &tlsConfig)
 	}
 
 	return &s, nil
